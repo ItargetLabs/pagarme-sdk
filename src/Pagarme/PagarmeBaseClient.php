@@ -29,6 +29,10 @@ class PagarmeBaseClient
             throw new DomainException('transactionId is required');
         }
 
+        if ($this->isChargeId($transactionId)) {
+            return $this->wrapChargeAsOrder($this->getChargeById($transactionId));
+        }
+
         return $this->request('GET', 'orders/' . urlencode($transactionId));
     }
 
@@ -154,7 +158,43 @@ class PagarmeBaseClient
     protected static function extractCharge(array $order): array
     {
         $charges = $order['charges'] ?? [];
-        return is_array($charges) && is_array($charges[0] ?? null) ? $charges[0] : [];
+        if (is_array($charges) && is_array($charges[0] ?? null)) {
+            return $charges[0];
+        }
+
+        if (!empty($order['payment_method'])) {
+            return $order;
+        }
+
+        return [];
+    }
+
+    protected function getChargeById(string $chargeId): array
+    {
+        return $this->request('GET', 'charges/' . urlencode($chargeId));
+    }
+
+    /**
+     * @param array<string, mixed> $charge
+     *
+     * @return array<string, mixed>
+     */
+    protected function wrapChargeAsOrder(array $charge): array
+    {
+        $order = $charge['order'] ?? null;
+        $orderId = is_array($order)
+            ? (string) ($order['id'] ?? '')
+            : (string) ($charge['order_id'] ?? '');
+
+        return [
+            'id' => $orderId,
+            'charges' => [$charge],
+        ];
+    }
+
+    private function isChargeId(string $transactionId): bool
+    {
+        return str_starts_with($transactionId, 'ch_');
     }
 
     protected static function extractLastTransaction(array $charge): array
