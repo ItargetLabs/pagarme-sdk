@@ -19,10 +19,6 @@ final class BankClient extends PagarmeBaseClient
 
     public function generateBank(BankRequest $request): BankResponse
     {
-        if ($request->customer->address === null) {
-            throw new Exception('Endereco do cliente obrigatorio para boleto Pagarme');
-        }
-
         $body = $this->createOrder($this->buildPayload($request));
         $charge = self::extractCharge($body);
         $transaction = self::extractLastTransaction($charge);
@@ -85,14 +81,19 @@ final class BankClient extends PagarmeBaseClient
 
     private function buildPayload(BankRequest $request): array
     {
+        $orderMetadata = $request->metadata;
+        unset($orderMetadata['instructions']);
+
+        $boleto = array_filter([
+            'due_at' => $request->dueDate->format('Y-m-d\T23:59:59\Z'),
+            'instructions' => $request->metadata['instructions'] ?? null,
+            'document_number' => $request->number,
+            'type' => $request->metadata['boleto_type'] ?? 'DM',
+        ], static fn($value) => $value !== null && $value !== '');
+
         $payment = [
             'payment_method' => 'boleto',
-            'boleto' => [
-                'due_at' => $request->dueDate->format('Y-m-d\TH:i:s\Z'),
-                'instructions' => $request->metadata['instructions'] ?? $request->description,
-                'document_number' => $request->number,
-                'type' => $request->metadata['boleto_type'] ?? 'DM',
-            ],
+            'boleto' => $boleto,
         ];
 
         return $this->buildOrderPayload(
@@ -101,7 +102,7 @@ final class BankClient extends PagarmeBaseClient
             $request->currency,
             $request->description,
             $request->number,
-            $request->metadata,
+            $orderMetadata,
             $this->withSplit($payment, $request->affiliates)
         );
     }

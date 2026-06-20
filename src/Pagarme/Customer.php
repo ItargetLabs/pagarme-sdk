@@ -12,7 +12,9 @@ final class Customer
         public string $email,
         public ?string $document = null,
         public ?string $phone = null,
-        public ?Address $address = null
+        public ?Address $address = null,
+        public ?string $documentType = null,
+        public ?string $type = null
     ) {
     }
 }

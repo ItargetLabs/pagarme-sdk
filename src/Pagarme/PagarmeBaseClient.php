@@ -29,10 +29,6 @@ class PagarmeBaseClient
             throw new DomainException('transactionId is required');
         }
 
-        if ($this->isChargeId($transactionId)) {
-            return $this->wrapChargeAsOrder($this->getChargeById($transactionId));
-        }
-
         return $this->request('GET', 'orders/' . urlencode($transactionId));
     }
 
@@ -105,13 +101,18 @@ class PagarmeBaseClient
             $decoded = json_decode((string) $response->getBody(), true);
             return is_array($decoded) ? $decoded : [];
         } catch (GuzzleException $exception) {
-            throw new Exception($this->extractErrorMessage($exception), (int) $exception->getCode(), $exception);
+            $message = $this->extractErrorMessage($exception);
+            if ($this->isGenericPagarmeError($message) && isset($options['json']) && is_array($options['json'])) {
+                $message .= ' | ' . $this->summarizePagarmePayload($options['json']);
+            }
+
+            throw new Exception($message, (int) $exception->getCode(), $exception);
         }
     }
 
     protected function createOrder(array $payload): array
     {
-        return $this->request('POST', 'orders', ['json' => $this->removeEmptyValues($payload)]);
+        return $this->request('POST', 'orders', ['json' => $payload]);
     }
 
     protected function getCharge(string $orderId): array
@@ -137,12 +138,35 @@ class PagarmeBaseClient
             'payments' => [$payment],
         ];
 
-        $sanitizedMetadata = $this->sanitizeMetadata($metadata);
-        if ($sanitizedMetadata !== []) {
-            $payload['metadata'] = $sanitizedMetadata;
+        if ($metadata !== []) {
+            $payload['metadata'] = $this->normalizeMetadata($metadata);
         }
 
         return $payload;
+    }
+
+    /** @param array<string, mixed> $metadata */
+    protected function normalizeMetadata(array $metadata): array
+    {
+        $normalized = [];
+
+        foreach ($metadata as $key => $value) {
+            if ($value === null) {
+                continue;
+            }
+
+            if (is_scalar($value) || is_array($value)) {
+                $normalized[(string) $key] = $value;
+                continue;
+            }
+
+            $encoded = json_encode($value, JSON_UNESCAPED_UNICODE);
+            if ($encoded !== false) {
+                $normalized[(string) $key] = $encoded;
+            }
+        }
+
+        return $normalized;
     }
 
     protected function buildSplitPayload(array $affiliates): array
@@ -158,43 +182,7 @@ class PagarmeBaseClient
     protected static function extractCharge(array $order): array
     {
         $charges = $order['charges'] ?? [];
-        if (is_array($charges) && is_array($charges[0] ?? null)) {
-            return $charges[0];
-        }
-
-        if (!empty($order['payment_method'])) {
-            return $order;
-        }
-
-        return [];
-    }
-
-    protected function getChargeById(string $chargeId): array
-    {
-        return $this->request('GET', 'charges/' . urlencode($chargeId));
-    }
-
-    /**
-     * @param array<string, mixed> $charge
-     *
-     * @return array<string, mixed>
-     */
-    protected function wrapChargeAsOrder(array $charge): array
-    {
-        $order = $charge['order'] ?? null;
-        $orderId = is_array($order)
-            ? (string) ($order['id'] ?? '')
-            : (string) ($charge['order_id'] ?? '');
-
-        return [
-            'id' => $orderId,
-            'charges' => [$charge],
-        ];
-    }
-
-    private function isChargeId(string $transactionId): bool
-    {
-        return str_starts_with($transactionId, 'ch_');
+        return is_array($charges) && is_array($charges[0] ?? null) ? $charges[0] : [];
     }
 
     protected static function extractLastTransaction(array $charge): array
@@ -237,21 +225,44 @@ class PagarmeBaseClient
             'code' => $customer->id,
             'name' => $customer->name,
             'email' => $customer->email,
-            'document' => $document,
-            'document_type' => $this->resolveDocumentType($document),
-            'type' => strlen($document) > 11 ? 'company' : 'individual',
         ];
 
-        return $this->removeEmptyValues(
-            $payload + $this->buildOptionalCustomerPayload($customer)
+        if ($document !== '') {
+            $payload['document'] = $document;
+            $payload['document_type'] = $customer->documentType ?? $this->resolveDocumentType($document);
+            $payload['type'] = $customer->type ?? $this->resolveCustomerType($document);
+        }
+
+        return array_filter(
+            $payload + $this->buildOptionalCustomerPayload($customer),
+            static fn($value) => $value !== null && $value !== ''
         );
+    }
+
+    private function resolveDocumentType(string $document): string
+    {
+        return match (strlen($document)) {
+            11 => 'CPF',
+            14 => 'CNPJ',
+            default => 'PASSPORT',
+        };
+    }
+
+    private function resolveCustomerType(string $document): string
+    {
+        return strlen($document) > 11 ? 'company' : 'individual';
     }
 
     private function buildOptionalCustomerPayload(Customer $customer): array
     {
+        $address = null;
+        if ($customer->address !== null) {
+            $address = $this->buildAddressPayload($customer->address);
+        }
+
         return [
             'phones' => $this->buildPhonePayload($customer->phone),
-            'address' => $customer->address ? $this->buildAddressPayload($customer->address) : null,
+            'address' => $address,
         ];
     }
 
@@ -270,148 +281,217 @@ class PagarmeBaseClient
         ]];
     }
 
-    private function buildAddressPayload(Address $address): array
+    private function buildAddressPayload(Address $address): ?array
     {
-        $neighborhood = substr(trim($address->neighborhood), 0, 64);
+        $line1 = trim($address->number . ', ' . $address->street, " ,");
+        $zipCode = preg_replace('/\D/', '', $address->zipCode);
+        $state = strtoupper(substr(trim($address->state), 0, 2));
+        $city = trim($address->city);
 
-        return $this->removeEmptyValues([
-            'line_1' => trim($address->street . ', ' . $address->number . ' - ' . $neighborhood),
+        if ($line1 === '' || $zipCode === '' || $city === '' || $state === '') {
+            return null;
+        }
+
+        return array_filter([
+            'line_1' => $line1,
             'line_2' => $address->complement,
-            'zip_code' => preg_replace('/\D/', '', $address->zipCode),
-            'city' => $address->city,
-            'state' => strtoupper($address->state),
+            'zip_code' => $zipCode,
+            'city' => $city,
+            'state' => $state,
             'country' => 'BR',
-        ]);
+        ], static fn($value) => $value !== null && $value !== '');
     }
 
     private function buildItemPayload(float $amount, string $description, ?string $number): array
     {
-        $normalizedDescription = substr(
-            preg_replace('/[^A-Za-z0-9 ]/', '', $description) ?? '',
-            0,
-            100
-        );
-
         return [
             'amount' => (int) round($amount * 100),
-            'description' => $normalizedDescription !== '' ? $normalizedDescription : 'Pagamento',
+            'description' => $description,
             'quantity' => 1,
             'code' => $number ?: uniqid('item_', true),
         ];
     }
 
-    /**
-     * @param array<string, mixed> $metadata
-     *
-     * @return array<string, string>
-     */
-    private function sanitizeMetadata(array $metadata): array
-    {
-        $sanitized = [];
-
-        foreach ($metadata as $key => $value) {
-            if ($value === null || $value === '') {
-                continue;
-            }
-
-            if (is_scalar($value)) {
-                $sanitized[(string) $key] = (string) $value;
-                continue;
-            }
-
-            if (is_array($value)) {
-                $encoded = json_encode($value, JSON_UNESCAPED_UNICODE);
-                if (is_string($encoded)) {
-                    $sanitized[(string) $key] = $encoded;
-                }
-            }
-        }
-
-        return $sanitized;
-    }
-
-    private function resolveDocumentType(string $document): string
-    {
-        if (strlen($document) > 11) {
-            return 'CNPJ';
-        }
-
-        if (strlen($document) === 11) {
-            return 'CPF';
-        }
-
-        return 'PASSPORT';
-    }
-
-    /**
-     * @param array<string, mixed> $data
-     *
-     * @return array<string, mixed>
-     */
-    private function removeEmptyValues(array $data): array
-    {
-        $result = [];
-
-        foreach ($data as $key => $value) {
-            if ($value === null || $value === '') {
-                continue;
-            }
-
-            if (is_array($value)) {
-                $nested = $this->removeEmptyValues($value);
-                if ($nested !== []) {
-                    $result[$key] = $nested;
-                }
-                continue;
-            }
-
-            $result[$key] = $value;
-        }
-
-        return $result;
-    }
-
     private function extractErrorMessage(GuzzleException $exception): string
     {
-        if (!method_exists($exception, 'getResponse') || !$exception->getResponse()) {
-            return $exception->getMessage();
+        $body = $this->extractResponseBody($exception);
+        if ($body !== '') {
+            $parsed = $this->parsePagarmeResponseBody($body);
+            if ($parsed !== '') {
+                return $parsed;
+            }
         }
 
-        $decoded = json_decode((string) $exception->getResponse()->getBody(), true);
-        return is_array($decoded) ? $this->extractDecodedErrorMessage($decoded) : $exception->getMessage();
+        $bodyFromMessage = $this->extractBodyFromGuzzleMessage($exception->getMessage());
+        if ($bodyFromMessage !== '') {
+            $parsed = $this->parsePagarmeResponseBody($bodyFromMessage);
+            if ($parsed !== '') {
+                return $parsed;
+            }
+        }
+
+        return $exception->getMessage();
+    }
+
+    private function extractResponseBody(GuzzleException $exception): string
+    {
+        if (!method_exists($exception, 'getResponse')) {
+            return '';
+        }
+
+        $response = $exception->getResponse();
+        if ($response === null) {
+            return '';
+        }
+
+        $stream = $response->getBody();
+        if ($stream->isSeekable()) {
+            $stream->rewind();
+        }
+
+        return trim((string) $stream);
+    }
+
+    private function extractBodyFromGuzzleMessage(string $message): string
+    {
+        if (preg_match('/response:\s*\R(.*)\s*$/s', $message, $matches) !== 1) {
+            return '';
+        }
+
+        return trim($matches[1]);
+    }
+
+    private function parsePagarmeResponseBody(string $body): string
+    {
+        $decoded = json_decode($body, true);
+        if (is_array($decoded)) {
+            return $this->extractDecodedErrorMessage($decoded);
+        }
+
+        if (is_string($decoded) && $decoded !== '') {
+            return $decoded;
+        }
+
+        return $body;
+    }
+
+    private function isGenericPagarmeError(string $message): bool
+    {
+        return str_contains($message, 'The request is invalid')
+            || str_contains($message, 'Client error:')
+            || str_contains($message, 'Erro desconhecido');
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function summarizePagarmePayload(array $payload): string
+    {
+        $customer = $payload['customer'] ?? null;
+        $payment = $payload['payments'][0] ?? null;
+        $summary = [
+            'customer' => is_array($customer) ? [
+                'name' => $customer['name'] ?? null,
+                'email' => $customer['email'] ?? null,
+                'document' => $customer['document'] ?? null,
+                'document_type' => $customer['document_type'] ?? null,
+                'type' => $customer['type'] ?? null,
+                'has_address' => isset($customer['address']) && is_array($customer['address']),
+            ] : null,
+            'amount' => $payload['items'][0]['amount'] ?? null,
+            'has_split' => is_array($payment) && isset($payment['split']),
+            'boleto' => is_array($payment) ? ($payment['boleto'] ?? null) : null,
+        ];
+
+        $encoded = json_encode($summary, JSON_UNESCAPED_UNICODE);
+        if ($encoded === false) {
+            return 'payload summary unavailable';
+        }
+
+        return 'request=' . $encoded;
     }
 
     private function extractDecodedErrorMessage(array $decoded): string
     {
+        $details = $this->collectPagarmeErrorDetails($decoded);
+        $summary = (string) ($decoded['message'] ?? 'Erro desconhecido');
+
+        if ($details === []) {
+            return $summary;
+        }
+
+        $detailsText = implode('; ', $details);
+
+        if ($summary === '' || $summary === 'Erro desconhecido' || $summary === 'The request is invalid.') {
+            return $detailsText;
+        }
+
+        return $summary . ': ' . $detailsText;
+    }
+
+    /** @return list<string> */
+    private function collectPagarmeErrorDetails(array $decoded): array
+    {
         $messages = [];
         $errors = $decoded['errors'] ?? null;
 
-        if (is_array($errors)) {
-            foreach ($errors as $field => $issues) {
-                if (!is_array($issues)) {
-                    continue;
+        if (!is_array($errors)) {
+            return $messages;
+        }
+
+        if (array_is_list($errors)) {
+            foreach ($errors as $error) {
+                $messages = [...$messages, ...$this->formatPagarmeErrorEntry($error, null)];
+            }
+
+            return $messages;
+        }
+
+        foreach ($errors as $field => $fieldErrors) {
+            if (!is_array($fieldErrors)) {
+                if (is_string($fieldErrors) && $fieldErrors !== '') {
+                    $messages[] = is_string($field) ? $field . ': ' . $fieldErrors : $fieldErrors;
                 }
 
-                if (isset($issues['message']) && is_string($issues['message'])) {
-                    $messages[] = (string) $issues['message'];
-                    continue;
-                }
+                continue;
+            }
 
-                foreach ($issues as $issue) {
-                    if (!is_string($issue) || $issue === '') {
-                        continue;
-                    }
-
-                    $messages[] = is_string($field) ? "{$field}: {$issue}" : $issue;
-                }
+            foreach ($fieldErrors as $error) {
+                $messages = [...$messages, ...$this->formatPagarmeErrorEntry($error, is_string($field) ? $field : null)];
             }
         }
 
-        if ($messages !== []) {
-            return implode(' | ', $messages);
+        return $messages;
+    }
+
+    /** @return list<string> */
+    private function formatPagarmeErrorEntry(mixed $error, ?string $field): array
+    {
+        if (is_string($error)) {
+            if ($error === '') {
+                return [];
+            }
+
+            if ($field !== null && $field !== '') {
+                return [$field . ': ' . $error];
+            }
+
+            return [$error];
         }
 
-        return (string) ($decoded['message'] ?? 'Erro desconhecido');
+        if (!is_array($error)) {
+            return [];
+        }
+
+        $message = $error['message'] ?? null;
+        if (!is_string($message) || $message === '') {
+            return [];
+        }
+
+        $parameter = $error['parameter_name'] ?? $error['field'] ?? $field;
+        if (is_string($parameter) && $parameter !== '') {
+            return [$parameter . ': ' . $message];
+        }
+
+        return [$message];
     }
 
     private static function normalizeStatus(string $status): string
