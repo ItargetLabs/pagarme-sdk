@@ -101,12 +101,7 @@ class PagarmeBaseClient
             $decoded = json_decode((string) $response->getBody(), true);
             return is_array($decoded) ? $decoded : [];
         } catch (GuzzleException $exception) {
-            $message = $this->extractErrorMessage($exception);
-            if ($this->isGenericPagarmeError($message) && isset($options['json']) && is_array($options['json'])) {
-                $message .= ' | ' . $this->summarizePagarmePayload($options['json']);
-            }
-
-            throw new Exception($message, (int) $exception->getCode(), $exception);
+            throw new Exception($exception->getMessage(), (int) $exception->getCode(), $exception);
         }
     }
 
@@ -155,7 +150,15 @@ class PagarmeBaseClient
                 continue;
             }
 
-            if (is_scalar($value) || is_array($value)) {
+            if (is_array($value)) {
+                $normalized[(string) $key] = implode(',', array_map(
+                    static fn(mixed $item): string => (string) $item,
+                    $value
+                ));
+                continue;
+            }
+
+            if (is_scalar($value)) {
                 $normalized[(string) $key] = $value;
                 continue;
             }
@@ -310,188 +313,6 @@ class PagarmeBaseClient
             'quantity' => 1,
             'code' => $number ?: uniqid('item_', true),
         ];
-    }
-
-    private function extractErrorMessage(GuzzleException $exception): string
-    {
-        $body = $this->extractResponseBody($exception);
-        if ($body !== '') {
-            $parsed = $this->parsePagarmeResponseBody($body);
-            if ($parsed !== '') {
-                return $parsed;
-            }
-        }
-
-        $bodyFromMessage = $this->extractBodyFromGuzzleMessage($exception->getMessage());
-        if ($bodyFromMessage !== '') {
-            $parsed = $this->parsePagarmeResponseBody($bodyFromMessage);
-            if ($parsed !== '') {
-                return $parsed;
-            }
-        }
-
-        return $exception->getMessage();
-    }
-
-    private function extractResponseBody(GuzzleException $exception): string
-    {
-        if (!method_exists($exception, 'getResponse')) {
-            return '';
-        }
-
-        $response = $exception->getResponse();
-        if ($response === null) {
-            return '';
-        }
-
-        $stream = $response->getBody();
-        if ($stream->isSeekable()) {
-            $stream->rewind();
-        }
-
-        return trim((string) $stream);
-    }
-
-    private function extractBodyFromGuzzleMessage(string $message): string
-    {
-        if (preg_match('/response:\s*\R(.*)\s*$/s', $message, $matches) !== 1) {
-            return '';
-        }
-
-        return trim($matches[1]);
-    }
-
-    private function parsePagarmeResponseBody(string $body): string
-    {
-        $decoded = json_decode($body, true);
-        if (is_array($decoded)) {
-            return $this->extractDecodedErrorMessage($decoded);
-        }
-
-        if (is_string($decoded) && $decoded !== '') {
-            return $decoded;
-        }
-
-        return $body;
-    }
-
-    private function isGenericPagarmeError(string $message): bool
-    {
-        return str_contains($message, 'The request is invalid')
-            || str_contains($message, 'Client error:')
-            || str_contains($message, 'Erro desconhecido');
-    }
-
-    /** @param array<string, mixed> $payload */
-    private function summarizePagarmePayload(array $payload): string
-    {
-        $customer = $payload['customer'] ?? null;
-        $payment = $payload['payments'][0] ?? null;
-        $summary = [
-            'customer' => is_array($customer) ? [
-                'name' => $customer['name'] ?? null,
-                'email' => $customer['email'] ?? null,
-                'document' => $customer['document'] ?? null,
-                'document_type' => $customer['document_type'] ?? null,
-                'type' => $customer['type'] ?? null,
-                'has_address' => isset($customer['address']) && is_array($customer['address']),
-            ] : null,
-            'amount' => $payload['items'][0]['amount'] ?? null,
-            'has_split' => is_array($payment) && isset($payment['split']),
-            'boleto' => is_array($payment) ? ($payment['boleto'] ?? null) : null,
-        ];
-
-        $encoded = json_encode($summary, JSON_UNESCAPED_UNICODE);
-        if ($encoded === false) {
-            return 'payload summary unavailable';
-        }
-
-        return 'request=' . $encoded;
-    }
-
-    private function extractDecodedErrorMessage(array $decoded): string
-    {
-        $details = $this->collectPagarmeErrorDetails($decoded);
-        $summary = (string) ($decoded['message'] ?? 'Erro desconhecido');
-
-        if ($details === []) {
-            return $summary;
-        }
-
-        $detailsText = implode('; ', $details);
-
-        if ($summary === '' || $summary === 'Erro desconhecido' || $summary === 'The request is invalid.') {
-            return $detailsText;
-        }
-
-        return $summary . ': ' . $detailsText;
-    }
-
-    /** @return list<string> */
-    private function collectPagarmeErrorDetails(array $decoded): array
-    {
-        $messages = [];
-        $errors = $decoded['errors'] ?? null;
-
-        if (!is_array($errors)) {
-            return $messages;
-        }
-
-        if (array_is_list($errors)) {
-            foreach ($errors as $error) {
-                $messages = [...$messages, ...$this->formatPagarmeErrorEntry($error, null)];
-            }
-
-            return $messages;
-        }
-
-        foreach ($errors as $field => $fieldErrors) {
-            if (!is_array($fieldErrors)) {
-                if (is_string($fieldErrors) && $fieldErrors !== '') {
-                    $messages[] = is_string($field) ? $field . ': ' . $fieldErrors : $fieldErrors;
-                }
-
-                continue;
-            }
-
-            foreach ($fieldErrors as $error) {
-                $messages = [...$messages, ...$this->formatPagarmeErrorEntry($error, is_string($field) ? $field : null)];
-            }
-        }
-
-        return $messages;
-    }
-
-    /** @return list<string> */
-    private function formatPagarmeErrorEntry(mixed $error, ?string $field): array
-    {
-        if (is_string($error)) {
-            if ($error === '') {
-                return [];
-            }
-
-            if ($field !== null && $field !== '') {
-                return [$field . ': ' . $error];
-            }
-
-            return [$error];
-        }
-
-        if (!is_array($error)) {
-            return [];
-        }
-
-        $message = $error['message'] ?? null;
-        if (!is_string($message) || $message === '') {
-            return [];
-        }
-
-        $parameter = $error['parameter_name'] ?? $error['field'] ?? $field;
-        if (is_string($parameter) && $parameter !== '') {
-            return [$parameter . ': ' . $message];
-        }
-
-        return [$message];
     }
 
     private static function normalizeStatus(string $status): string
