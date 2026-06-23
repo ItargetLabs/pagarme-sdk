@@ -45,7 +45,7 @@ final class PixClientTest extends TestCase
         ));
 
         $payload = json_decode((string) $history[0]['request']->getBody(), true, 512, JSON_THROW_ON_ERROR);
-        $this->assertSame('ch_1', $response->tid);
+        $this->assertSame('or_1', $response->tid);
         $this->assertSame('pix-copy-paste', $response->pixCopyPaste);
         $this->assertSame('pix', $payload['payments'][0]['payment_method']);
         $this->assertSame(1000, $payload['items'][0]['amount']);

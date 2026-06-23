@@ -25,7 +25,7 @@ final class PixClient extends PagarmeBaseClient
         $transaction = self::extractLastTransaction($charge);
 
         return new PixResponse(
-            tid: (string) ($charge['id'] ?? $body['id'] ?? ''),
+            tid: (string) ($body['id'] ?? ''),
             status: self::mapPagarmeStatus((string) ($charge['status'] ?? 'pending')),
             amount: (float) (($charge['amount'] ?? (int) round($request->amount * 100)) / 100),
             currency: $request->currency,
@@ -52,7 +52,7 @@ final class PixClient extends PagarmeBaseClient
 
         return new PixStatusResponse(
             status: self::mapPagarmeStatus((string) ($charge['status'] ?? 'pending')),
-            tid: (string) ($charge['id'] ?? $pixId),
+            tid: (string) ($body['id'] ?? $pixId),
             nsu: $this->stringOrNull($transaction['acquirer_nsu'] ?? null),
             amount: (float) (($charge['amount'] ?? 0) / 100),
             authorizationCode: null,
